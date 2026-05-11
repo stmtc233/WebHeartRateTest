@@ -173,12 +173,12 @@ async function ensureFaceLandmarker() {
   const options = {
     baseOptions: {
       modelAssetPath: MODEL_URL,
-      delegate: "GPU",
+      delegate: IS_MOBILE ? "CPU" : "GPU",
     },
     numFaces: effectiveMaxFaces(),
-    minFaceDetectionConfidence: IS_MOBILE ? 0.4 : 0.55,
-    minFacePresenceConfidence: IS_MOBILE ? 0.4 : 0.55,
-    minTrackingConfidence: IS_MOBILE ? 0.4 : 0.5,
+    minFaceDetectionConfidence: IS_MOBILE ? 0.68 : 0.55,
+    minFacePresenceConfidence: IS_MOBILE ? 0.68 : 0.55,
+    minTrackingConfidence: IS_MOBILE ? 0.58 : 0.5,
     outputFaceBlendshapes: false,
     runningMode: "VIDEO",
   };
@@ -316,6 +316,7 @@ function collectDetections(faceLandmarks) {
     .map((landmarks) => {
       const box = landmarksToBox(landmarks);
       if (!box || box.width < 28 || box.height < 28) return null;
+      if (!isPlausibleFace(landmarks, box)) return null;
       const rects = pulseRects(box);
       const rgb = sampleRgb(rects);
       return {
@@ -332,27 +333,88 @@ function collectDetections(faceLandmarks) {
     .filter(Boolean);
 }
 
+function isPlausibleFace(landmarks, box) {
+  const width = el.sampleCanvas.width;
+  const height = el.sampleCanvas.height;
+  if (!width || !height) return false;
+
+  const widthRatio = box.width / width;
+  const heightRatio = box.height / height;
+  const areaRatio = (box.width * box.height) / (width * height);
+  const aspectRatio = box.width / Math.max(box.height, 1);
+
+  if (widthRatio > 0.82 || heightRatio > 0.9 || areaRatio > 0.5) return false;
+  if (widthRatio < 0.05 || heightRatio < 0.07) return false;
+  if (aspectRatio < 0.45 || aspectRatio > 1.65) return false;
+
+  let outOfFrame = 0;
+  for (const point of landmarks) {
+    if (
+      point.x < -0.08 ||
+      point.x > 1.08 ||
+      point.y < -0.08 ||
+      point.y > 1.08 ||
+      !Number.isFinite(point.x) ||
+      !Number.isFinite(point.y)
+    ) {
+      outOfFrame += 1;
+    }
+  }
+  if (outOfFrame / landmarks.length > 0.03) return false;
+
+  const leftEye = midpoint(landmarks[33], landmarks[133]);
+  const rightEye = midpoint(landmarks[362], landmarks[263]);
+  const nose = landmarks[1];
+  const mouthLeft = landmarks[61];
+  const mouthRight = landmarks[291];
+  const chin = landmarks[152];
+
+  if (!leftEye || !rightEye || !nose || !mouthLeft || !mouthRight || !chin) {
+    return true;
+  }
+
+  const eyeDistance = normalizedDistance(leftEye, rightEye, width, height);
+  const faceHeight = box.height;
+  const mouthWidth = normalizedDistance(mouthLeft, mouthRight, width, height);
+  const noseToChin = normalizedDistance(nose, chin, width, height);
+  const eyeY = ((leftEye.y + rightEye.y) / 2) * height;
+  const noseY = nose.y * height;
+  const mouthY = ((mouthLeft.y + mouthRight.y) / 2) * height;
+  const chinY = chin.y * height;
+
+  if (eyeDistance < box.width * 0.16 || eyeDistance > box.width * 0.68) return false;
+  if (mouthWidth < box.width * 0.12 || mouthWidth > box.width * 0.72) return false;
+  if (noseToChin < faceHeight * 0.18 || noseToChin > faceHeight * 0.72) return false;
+  if (!(eyeY < noseY && noseY < mouthY && mouthY < chinY)) return false;
+
+  return true;
+}
+
 function landmarksToBox(landmarks) {
   const width = el.sampleCanvas.width;
   const height = el.sampleCanvas.height;
   if (!width || !height || !landmarks.length) return null;
 
-  let minX = Infinity;
-  let minY = Infinity;
-  let maxX = -Infinity;
-  let maxY = -Infinity;
+  const xs = [];
+  const ys = [];
 
   for (const point of landmarks) {
     const x = point.x * width;
     const y = point.y * height;
     if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
-    minX = Math.min(minX, x);
-    minY = Math.min(minY, y);
-    maxX = Math.max(maxX, x);
-    maxY = Math.max(maxY, y);
+    xs.push(x);
+    ys.push(y);
   }
 
-  if (!Number.isFinite(minX) || !Number.isFinite(minY)) return null;
+  if (xs.length < 80 || ys.length < 80) return null;
+
+  xs.sort((a, b) => a - b);
+  ys.sort((a, b) => a - b);
+
+  const minX = percentile(xs, 0.03);
+  const maxX = percentile(xs, 0.97);
+  const minY = percentile(ys, 0.03);
+  const maxY = percentile(ys, 0.97);
 
   const rawWidth = maxX - minX;
   const rawHeight = maxY - minY;
@@ -933,7 +995,7 @@ function getMaxFaces() {
 }
 
 function effectiveMaxFaces() {
-  return IS_MOBILE ? Math.min(getMaxFaces(), 3) : getMaxFaces();
+  return IS_MOBILE ? Math.min(getMaxFaces(), 2) : getMaxFaces();
 }
 
 function cameraErrorMessage(error) {
@@ -959,6 +1021,30 @@ function pointDistance(a, b) {
   const dx = a.x - b.x;
   const dy = a.y - b.y;
   return Math.hypot(dx, dy);
+}
+
+function midpoint(a, b) {
+  if (!a || !b) return null;
+  return {
+    x: (a.x + b.x) / 2,
+    y: (a.y + b.y) / 2,
+  };
+}
+
+function normalizedDistance(a, b, width, height) {
+  const dx = (a.x - b.x) * width;
+  const dy = (a.y - b.y) * height;
+  return Math.hypot(dx, dy);
+}
+
+function percentile(sortedValues, ratio) {
+  if (!sortedValues.length) return 0;
+  const index = clamp(
+    Math.round((sortedValues.length - 1) * ratio),
+    0,
+    sortedValues.length - 1,
+  );
+  return sortedValues[index];
 }
 
 function clampBox(box) {
