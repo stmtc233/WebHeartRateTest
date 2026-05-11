@@ -14,10 +14,7 @@ const MAX_SIGNAL_SECONDS = 32;
 const MIN_ANALYSIS_SECONDS = 8;
 const TRACK_TTL_SECONDS = 1.4;
 const ESTIMATE_INTERVAL_MS = 900;
-const IS_MOBILE =
-  /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
-  (navigator.maxTouchPoints > 1 && window.innerWidth < 960);
-const INFERENCE_INTERVAL_MS = IS_MOBILE ? 90 : 60;
+const FRAME_SAMPLE_INTERVAL_MS = 60;
 
 const palette = [
   "#0d8b72",
@@ -56,7 +53,6 @@ let faceLandmarker;
 let stream;
 let rafId = 0;
 let running = false;
-let lastVideoTime = -1;
 let lastInferenceMs = 0;
 let appStartMs = 0;
 let nextTrackId = 1;
@@ -80,7 +76,7 @@ el.cameraSelect.addEventListener("change", () => {
 });
 el.maxFacesSelect.addEventListener("change", async () => {
   if (faceLandmarker) {
-    await faceLandmarker.setOptions({ numFaces: effectiveMaxFaces() });
+    await faceLandmarker.setOptions({ numFaces: getMaxFaces() });
   }
 });
 
@@ -117,7 +113,6 @@ async function start() {
     tracks = new Map();
     nextTrackId = 1;
     appStartMs = performance.now();
-    lastVideoTime = -1;
     lastInferenceMs = 0;
     fpsMeter = { frames: 0, lastMs: performance.now(), fps: 0 };
     running = true;
@@ -173,12 +168,12 @@ async function ensureFaceLandmarker() {
   const options = {
     baseOptions: {
       modelAssetPath: MODEL_URL,
-      delegate: IS_MOBILE ? "CPU" : "GPU",
+      delegate: "GPU",
     },
-    numFaces: effectiveMaxFaces(),
-    minFaceDetectionConfidence: IS_MOBILE ? 0.68 : 0.55,
-    minFacePresenceConfidence: IS_MOBILE ? 0.68 : 0.55,
-    minTrackingConfidence: IS_MOBILE ? 0.58 : 0.5,
+    numFaces: getMaxFaces(),
+    minFaceDetectionConfidence: 0.72,
+    minFacePresenceConfidence: 0.68,
+    minTrackingConfidence: 0.55,
     outputFaceBlendshapes: false,
     runningMode: "VIDEO",
   };
@@ -202,9 +197,9 @@ async function openCamera() {
   const constraints = {
     audio: false,
     video: {
-      width: { ideal: IS_MOBILE ? 640 : 1280 },
-      height: { ideal: IS_MOBILE ? 480 : 720 },
-      frameRate: { ideal: IS_MOBILE ? 24 : 30, max: IS_MOBILE ? 30 : 60 },
+      width: { ideal: 1280 },
+      height: { ideal: 720 },
+      frameRate: { ideal: 30, max: 60 },
       ...(selectedDeviceId
         ? { deviceId: { exact: selectedDeviceId } }
         : { facingMode: { ideal: currentFacingMode } }),
@@ -263,9 +258,8 @@ function processFrame(nowMs) {
   if (!running) return;
 
   const video = el.cameraFeed;
-  if (video.readyState >= 2 && nowMs - lastInferenceMs >= INFERENCE_INTERVAL_MS) {
+  if (video.readyState >= 2 && nowMs - lastInferenceMs >= FRAME_SAMPLE_INTERVAL_MS) {
     lastInferenceMs = nowMs;
-    lastVideoTime = video.currentTime;
     drawSampleFrame();
 
     const results = faceLandmarker.detectForVideo(video, nowMs);
@@ -316,7 +310,6 @@ function collectDetections(faceLandmarks) {
     .map((landmarks) => {
       const box = landmarksToBox(landmarks);
       if (!box || box.width < 28 || box.height < 28) return null;
-      if (!isPlausibleFace(landmarks, box)) return null;
       const rects = pulseRects(box);
       const rgb = sampleRgb(rects);
       return {
@@ -331,63 +324,6 @@ function collectDetections(faceLandmarks) {
       };
     })
     .filter(Boolean);
-}
-
-function isPlausibleFace(landmarks, box) {
-  const width = el.sampleCanvas.width;
-  const height = el.sampleCanvas.height;
-  if (!width || !height) return false;
-
-  const widthRatio = box.width / width;
-  const heightRatio = box.height / height;
-  const areaRatio = (box.width * box.height) / (width * height);
-  const aspectRatio = box.width / Math.max(box.height, 1);
-
-  if (widthRatio > 0.82 || heightRatio > 0.9 || areaRatio > 0.5) return false;
-  if (widthRatio < 0.05 || heightRatio < 0.07) return false;
-  if (aspectRatio < 0.45 || aspectRatio > 1.65) return false;
-
-  let outOfFrame = 0;
-  for (const point of landmarks) {
-    if (
-      point.x < -0.08 ||
-      point.x > 1.08 ||
-      point.y < -0.08 ||
-      point.y > 1.08 ||
-      !Number.isFinite(point.x) ||
-      !Number.isFinite(point.y)
-    ) {
-      outOfFrame += 1;
-    }
-  }
-  if (outOfFrame / landmarks.length > 0.03) return false;
-
-  const leftEye = midpoint(landmarks[33], landmarks[133]);
-  const rightEye = midpoint(landmarks[362], landmarks[263]);
-  const nose = landmarks[1];
-  const mouthLeft = landmarks[61];
-  const mouthRight = landmarks[291];
-  const chin = landmarks[152];
-
-  if (!leftEye || !rightEye || !nose || !mouthLeft || !mouthRight || !chin) {
-    return true;
-  }
-
-  const eyeDistance = normalizedDistance(leftEye, rightEye, width, height);
-  const faceHeight = box.height;
-  const mouthWidth = normalizedDistance(mouthLeft, mouthRight, width, height);
-  const noseToChin = normalizedDistance(nose, chin, width, height);
-  const eyeY = ((leftEye.y + rightEye.y) / 2) * height;
-  const noseY = nose.y * height;
-  const mouthY = ((mouthLeft.y + mouthRight.y) / 2) * height;
-  const chinY = chin.y * height;
-
-  if (eyeDistance < box.width * 0.16 || eyeDistance > box.width * 0.68) return false;
-  if (mouthWidth < box.width * 0.12 || mouthWidth > box.width * 0.72) return false;
-  if (noseToChin < faceHeight * 0.18 || noseToChin > faceHeight * 0.72) return false;
-  if (!(eyeY < noseY && noseY < mouthY && mouthY < chinY)) return false;
-
-  return true;
 }
 
 function landmarksToBox(landmarks) {
@@ -994,10 +930,6 @@ function getMaxFaces() {
   return Number(el.maxFacesSelect.value);
 }
 
-function effectiveMaxFaces() {
-  return IS_MOBILE ? Math.min(getMaxFaces(), 2) : getMaxFaces();
-}
-
 function cameraErrorMessage(error) {
   if (error?.name === "NotAllowedError") return "摄像头权限被拒绝";
   if (error?.name === "NotFoundError") return "未找到摄像头";
@@ -1020,20 +952,6 @@ function formatRuntime(seconds) {
 function pointDistance(a, b) {
   const dx = a.x - b.x;
   const dy = a.y - b.y;
-  return Math.hypot(dx, dy);
-}
-
-function midpoint(a, b) {
-  if (!a || !b) return null;
-  return {
-    x: (a.x + b.x) / 2,
-    y: (a.y + b.y) / 2,
-  };
-}
-
-function normalizedDistance(a, b, width, height) {
-  const dx = (a.x - b.x) * width;
-  const dy = (a.y - b.y) * height;
   return Math.hypot(dx, dy);
 }
 
