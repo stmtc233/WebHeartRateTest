@@ -14,7 +14,13 @@ const MAX_SIGNAL_SECONDS = 32;
 const MIN_ANALYSIS_SECONDS = 8;
 const TRACK_TTL_SECONDS = 1.4;
 const ESTIMATE_INTERVAL_MS = 900;
-const FRAME_SAMPLE_INTERVAL_MS = 60;
+const MIN_INFERENCE_INTERVAL_MS = 70;
+const CAMERA_WARMUP_MS = 700;
+const MAX_PROCESSING_SIDE = 720;
+const MIN_FACE_BOX_AREA_RATIO = 0.015;
+const MAX_FACE_BOX_AREA_RATIO = 0.62;
+const MIN_FACE_BOX_ASPECT_RATIO = 0.5;
+const MAX_FACE_BOX_ASPECT_RATIO = 1.9;
 
 const palette = [
   "#0d8b72",
@@ -53,12 +59,16 @@ let faceLandmarker;
 let stream;
 let rafId = 0;
 let running = false;
-let lastInferenceMs = 0;
 let appStartMs = 0;
 let nextTrackId = 1;
 let tracks = new Map();
-let fpsMeter = { frames: 0, lastMs: performance.now(), fps: 0 };
+let fpsMeter = resetFpsMeter();
 let lastUiRenderMs = 0;
+let lastAnalysisMs = 0;
+let lastVideoFrameId = -1;
+let lastVideoWidth = 0;
+let lastVideoHeight = 0;
+let cameraWarmupUntilMs = 0;
 let currentFacingMode = "user";
 
 window.lucide?.createIcons();
@@ -80,7 +90,7 @@ el.maxFacesSelect.addEventListener("change", async () => {
   }
 });
 
-window.addEventListener("resize", fitCanvasToVideo);
+window.addEventListener("resize", () => fitCanvasToVideo());
 
 initCameraList();
 
@@ -113,8 +123,9 @@ async function start() {
     tracks = new Map();
     nextTrackId = 1;
     appStartMs = performance.now();
-    lastInferenceMs = 0;
-    fpsMeter = { frames: 0, lastMs: performance.now(), fps: 0 };
+    fpsMeter = resetFpsMeter(appStartMs);
+    lastUiRenderMs = 0;
+    lastAnalysisMs = 0;
     running = true;
     el.stagePlaceholder.classList.add("is-hidden");
     setStatus("实时检测中", "ready");
@@ -141,6 +152,12 @@ function stop() {
   clearCanvas(overlayCtx, el.overlayCanvas);
   renderPeople();
   updateStats(0);
+  fpsMeter = resetFpsMeter();
+  lastAnalysisMs = 0;
+  lastVideoFrameId = -1;
+  lastVideoWidth = 0;
+  lastVideoHeight = 0;
+  cameraWarmupUntilMs = 0;
   el.stopButton.disabled = true;
   el.startButton.disabled = false;
   setStatus("待启动", "idle");
@@ -156,7 +173,8 @@ async function restartCamera() {
   tracks.clear();
   if (wasRunning) {
     await openCamera();
-    lastInferenceMs = 0;
+    fpsMeter = resetFpsMeter();
+    lastAnalysisMs = 0;
     running = true;
     rafId = requestAnimationFrame(processFrame);
   }
@@ -214,27 +232,43 @@ async function openCamera() {
   const settings = videoTrack?.getSettings?.() ?? {};
   currentFacingMode = settings.facingMode || currentFacingMode;
 
-  fitCanvasToVideo();
+  fitCanvasToVideo(true);
   const devices = await navigator.mediaDevices.enumerateDevices();
   fillCameraSelect(devices, settings.deviceId);
 }
 
 function waitForVideo(video) {
   return new Promise((resolve) => {
+    let settled = false;
+
     const finish = async () => {
       try {
         await video.play();
       } catch {
         // Muted autoplay should normally work after a user gesture, but browsers vary.
       }
+
+      if (!video.videoWidth || !video.videoHeight) {
+        requestAnimationFrame(finish);
+        return;
+      }
+
+      if (settled) return;
+      settled = true;
       resolve();
     };
 
-    if (video.readyState >= 2 && video.videoWidth) {
+    if (video.readyState >= 2 && video.videoWidth && video.videoHeight) {
       finish();
       return;
     }
-    video.onloadedmetadata = finish;
+
+    const onReady = () => {
+      finish();
+    };
+
+    video.addEventListener("loadedmetadata", onReady, { once: true });
+    video.addEventListener("loadeddata", onReady, { once: true });
   });
 }
 
@@ -258,58 +292,103 @@ function processFrame(nowMs) {
   if (!running) return;
 
   const video = el.cameraFeed;
-  if (video.readyState >= 2 && nowMs - lastInferenceMs >= FRAME_SAMPLE_INTERVAL_MS) {
-    lastInferenceMs = nowMs;
-    drawSampleFrame();
 
-    const results = faceLandmarker.detectForVideo(video, nowMs);
-    const timestamp = nowMs / 1000;
-    const detections = collectDetections(results.faceLandmarks ?? []);
-    matchTracks(detections, timestamp, nowMs);
-    drawOverlay(timestamp);
+  if (video.readyState >= 2 && video.videoWidth && video.videoHeight) {
+    fitCanvasToVideo(false, nowMs);
 
-    fpsMeter.frames += 1;
-    if (nowMs - fpsMeter.lastMs >= 1000) {
-      fpsMeter.fps = Math.round((fpsMeter.frames * 1000) / (nowMs - fpsMeter.lastMs));
-      fpsMeter.frames = 0;
-      fpsMeter.lastMs = nowMs;
+    const frameId = getVideoFrameId(video);
+    const hasNewFrame = frameId !== lastVideoFrameId;
+    const isInferenceDue = nowMs - lastAnalysisMs >= MIN_INFERENCE_INTERVAL_MS;
+    const isFrameCheckStale = nowMs - lastAnalysisMs >= 500;
+
+    if (isInferenceDue && (hasNewFrame || isFrameCheckStale)) {
+      lastVideoFrameId = frameId;
+      lastAnalysisMs = nowMs;
+      drawSampleFrame();
+      if (nowMs >= cameraWarmupUntilMs) {
+        analyzeFrame(nowMs);
+      }
     }
+  }
 
-    if (nowMs - lastUiRenderMs > 220) {
-      renderPeople();
-      updateStats(nowMs);
-      lastUiRenderMs = nowMs;
-    }
+  if (nowMs - lastUiRenderMs > 220) {
+    renderPeople();
+    updateStats(nowMs);
+    lastUiRenderMs = nowMs;
   }
 
   rafId = requestAnimationFrame(processFrame);
 }
 
-function drawSampleFrame() {
-  const { videoWidth, videoHeight } = el.cameraFeed;
-  if (!videoWidth || !videoHeight) return;
-  if (el.sampleCanvas.width !== videoWidth || el.sampleCanvas.height !== videoHeight) {
-    el.sampleCanvas.width = videoWidth;
-    el.sampleCanvas.height = videoHeight;
+function analyzeFrame(nowMs) {
+  try {
+    const results = faceLandmarker.detectForVideo(el.sampleCanvas, nowMs);
+    const timestamp = nowMs / 1000;
+    const detections = collectDetections(results.faceLandmarks ?? []);
+    matchTracks(detections, timestamp, nowMs);
+    drawOverlay(timestamp);
+    tickFps(nowMs);
+  } catch (error) {
+    console.warn("Face detection failed for this frame.", error);
   }
-  sampleCtx.drawImage(el.cameraFeed, 0, 0, videoWidth, videoHeight);
 }
 
-function fitCanvasToVideo() {
+function drawSampleFrame() {
+  const { width: canvasWidth, height: canvasHeight } = el.sampleCanvas;
+  if (!canvasWidth || !canvasHeight) return;
   const { videoWidth, videoHeight } = el.cameraFeed;
   if (!videoWidth || !videoHeight) return;
-  el.overlayCanvas.width = videoWidth;
-  el.overlayCanvas.height = videoHeight;
-  el.sampleCanvas.width = videoWidth;
-  el.sampleCanvas.height = videoHeight;
+  sampleCtx.drawImage(el.cameraFeed, 0, 0, canvasWidth, canvasHeight);
+}
+
+function fitCanvasToVideo(force = false, nowMs = performance.now()) {
+  const { videoWidth, videoHeight } = el.cameraFeed;
+  if (!videoWidth || !videoHeight) return;
+  if (!force && videoWidth === lastVideoWidth && videoHeight === lastVideoHeight) {
+    return;
+  }
+  const size = processingSize(videoWidth, videoHeight);
+  lastVideoWidth = videoWidth;
+  lastVideoHeight = videoHeight;
+  el.overlayCanvas.width = size.width;
+  el.overlayCanvas.height = size.height;
+  el.sampleCanvas.width = size.width;
+  el.sampleCanvas.height = size.height;
   el.resolutionText.textContent = `${videoWidth} x ${videoHeight}`;
+  tracks.clear();
+  nextTrackId = 1;
+  clearCanvas(overlayCtx, el.overlayCanvas);
+  renderPeople();
+  cameraWarmupUntilMs = nowMs + CAMERA_WARMUP_MS;
+  lastVideoFrameId = -1;
+  lastAnalysisMs = 0;
+}
+
+function getVideoFrameId(video) {
+  const totalFrames = video.getVideoPlaybackQuality?.().totalVideoFrames;
+  if (Number.isFinite(totalFrames) && totalFrames > 0) return totalFrames;
+
+  const decodedFrames = video.webkitDecodedFrameCount;
+  if (Number.isFinite(decodedFrames) && decodedFrames > 0) return decodedFrames;
+
+  return video.currentTime;
+}
+
+function processingSize(width, height) {
+  const scale = Math.min(1, MAX_PROCESSING_SIDE / Math.max(width, height));
+  return {
+    width: Math.max(1, Math.round(width * scale)),
+    height: Math.max(1, Math.round(height * scale)),
+  };
 }
 
 function collectDetections(faceLandmarks) {
   return faceLandmarks
     .map((landmarks) => {
       const box = landmarksToBox(landmarks);
-      if (!box || box.width < 28 || box.height < 28) return null;
+      if (!box || box.width < 28 || box.height < 28 || !isLikelyFaceBox(box)) {
+        return null;
+      }
       const rects = pulseRects(box);
       const rgb = sampleRgb(rects);
       return {
@@ -363,6 +442,22 @@ function landmarksToBox(landmarks) {
     width: rawWidth + padX * 2,
     height: rawHeight + padY * 2,
   });
+}
+
+function isLikelyFaceBox(box) {
+  const width = el.sampleCanvas.width || 1;
+  const height = el.sampleCanvas.height || 1;
+  const areaRatio = (box.width * box.height) / (width * height);
+  const aspectRatio = box.width / box.height;
+
+  if (areaRatio < MIN_FACE_BOX_AREA_RATIO || areaRatio > MAX_FACE_BOX_AREA_RATIO) {
+    return false;
+  }
+
+  return (
+    aspectRatio >= MIN_FACE_BOX_ASPECT_RATIO &&
+    aspectRatio <= MAX_FACE_BOX_ASPECT_RATIO
+  );
 }
 
 function pulseRects(box) {
@@ -912,6 +1007,19 @@ function updateStats(nowMs) {
     return;
   }
   el.runtimeText.textContent = formatRuntime((nowMs - appStartMs) / 1000);
+}
+
+function resetFpsMeter(nowMs = performance.now()) {
+  return { frames: 0, lastMs: nowMs, fps: 0 };
+}
+
+function tickFps(nowMs) {
+  fpsMeter.frames += 1;
+  if (nowMs - fpsMeter.lastMs < 1000) return;
+
+  fpsMeter.fps = Math.round((fpsMeter.frames * 1000) / (nowMs - fpsMeter.lastMs));
+  fpsMeter.frames = 0;
+  fpsMeter.lastMs = nowMs;
 }
 
 function setStatus(text, state) {
