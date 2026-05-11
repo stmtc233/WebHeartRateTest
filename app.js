@@ -14,6 +14,10 @@ const MAX_SIGNAL_SECONDS = 32;
 const MIN_ANALYSIS_SECONDS = 8;
 const TRACK_TTL_SECONDS = 1.4;
 const ESTIMATE_INTERVAL_MS = 900;
+const IS_MOBILE =
+  /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+  (navigator.maxTouchPoints > 1 && window.innerWidth < 960);
+const INFERENCE_INTERVAL_MS = IS_MOBILE ? 90 : 60;
 
 const palette = [
   "#0d8b72",
@@ -53,6 +57,7 @@ let stream;
 let rafId = 0;
 let running = false;
 let lastVideoTime = -1;
+let lastInferenceMs = 0;
 let appStartMs = 0;
 let nextTrackId = 1;
 let tracks = new Map();
@@ -75,7 +80,7 @@ el.cameraSelect.addEventListener("change", () => {
 });
 el.maxFacesSelect.addEventListener("change", async () => {
   if (faceLandmarker) {
-    await faceLandmarker.setOptions({ numFaces: getMaxFaces() });
+    await faceLandmarker.setOptions({ numFaces: effectiveMaxFaces() });
   }
 });
 
@@ -113,6 +118,7 @@ async function start() {
     nextTrackId = 1;
     appStartMs = performance.now();
     lastVideoTime = -1;
+    lastInferenceMs = 0;
     fpsMeter = { frames: 0, lastMs: performance.now(), fps: 0 };
     running = true;
     el.stagePlaceholder.classList.add("is-hidden");
@@ -155,6 +161,7 @@ async function restartCamera() {
   tracks.clear();
   if (wasRunning) {
     await openCamera();
+    lastInferenceMs = 0;
     running = true;
     rafId = requestAnimationFrame(processFrame);
   }
@@ -168,10 +175,10 @@ async function ensureFaceLandmarker() {
       modelAssetPath: MODEL_URL,
       delegate: "GPU",
     },
-    numFaces: getMaxFaces(),
-    minFaceDetectionConfidence: 0.55,
-    minFacePresenceConfidence: 0.55,
-    minTrackingConfidence: 0.5,
+    numFaces: effectiveMaxFaces(),
+    minFaceDetectionConfidence: IS_MOBILE ? 0.4 : 0.55,
+    minFacePresenceConfidence: IS_MOBILE ? 0.4 : 0.55,
+    minTrackingConfidence: IS_MOBILE ? 0.4 : 0.5,
     outputFaceBlendshapes: false,
     runningMode: "VIDEO",
   };
@@ -195,12 +202,12 @@ async function openCamera() {
   const constraints = {
     audio: false,
     video: {
-      width: { ideal: 1280 },
-      height: { ideal: 720 },
-      frameRate: { ideal: 30, max: 60 },
+      width: { ideal: IS_MOBILE ? 640 : 1280 },
+      height: { ideal: IS_MOBILE ? 480 : 720 },
+      frameRate: { ideal: IS_MOBILE ? 24 : 30, max: IS_MOBILE ? 30 : 60 },
       ...(selectedDeviceId
         ? { deviceId: { exact: selectedDeviceId } }
-        : { facingMode: currentFacingMode }),
+        : { facingMode: { ideal: currentFacingMode } }),
     },
   };
 
@@ -256,7 +263,8 @@ function processFrame(nowMs) {
   if (!running) return;
 
   const video = el.cameraFeed;
-  if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+  if (video.readyState >= 2 && nowMs - lastInferenceMs >= INFERENCE_INTERVAL_MS) {
+    lastInferenceMs = nowMs;
     lastVideoTime = video.currentTime;
     drawSampleFrame();
 
@@ -922,6 +930,10 @@ function setButtons(isBusy) {
 
 function getMaxFaces() {
   return Number(el.maxFacesSelect.value);
+}
+
+function effectiveMaxFaces() {
+  return IS_MOBILE ? Math.min(getMaxFaces(), 3) : getMaxFaces();
 }
 
 function cameraErrorMessage(error) {
