@@ -14,9 +14,11 @@ const MAX_SIGNAL_SECONDS = 32;
 const MIN_ANALYSIS_SECONDS = 8;
 const TRACK_TTL_SECONDS = 1.4;
 const ESTIMATE_INTERVAL_MS = 900;
-const MIN_INFERENCE_INTERVAL_MS = 100;
+const IS_MOBILE =
+  /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+  (navigator.maxTouchPoints > 1 && window.innerWidth < 960);
+const INFERENCE_INTERVAL_MS = IS_MOBILE ? 90 : 60;
 const CAMERA_WARMUP_MS = 700;
-const MAX_PROCESSING_SIDE = 480;
 const MIN_FACE_BOX_AREA_RATIO = 0.015;
 const MAX_FACE_BOX_AREA_RATIO = 0.62;
 const MIN_FACE_BOX_ASPECT_RATIO = 0.5;
@@ -69,8 +71,6 @@ let lastVideoWidth = 0;
 let lastVideoHeight = 0;
 let cameraWarmupUntilMs = 0;
 let currentFacingMode = "user";
-let frameLoopMode = "raf";
-let frameLoopCancelId = 0;
 
 window.lucide?.createIcons();
 
@@ -87,7 +87,7 @@ el.cameraSelect.addEventListener("change", () => {
 });
 el.maxFacesSelect.addEventListener("change", async () => {
   if (faceLandmarker) {
-    await faceLandmarker.setOptions({ numFaces: getMaxFaces() });
+    await faceLandmarker.setOptions({ numFaces: effectiveMaxFaces() });
   }
 });
 
@@ -130,7 +130,7 @@ async function start() {
     running = true;
     el.stagePlaceholder.classList.add("is-hidden");
     setStatus("实时检测中", "ready");
-    startFrameLoop();
+    rafId = requestAnimationFrame(processFrame);
   } catch (error) {
     console.error(error);
     stop();
@@ -142,7 +142,8 @@ async function start() {
 
 function stop() {
   running = false;
-  stopFrameLoop();
+  cancelAnimationFrame(rafId);
+  rafId = 0;
   if (stream) {
     stream.getTracks().forEach((track) => track.stop());
     stream = null;
@@ -166,7 +167,8 @@ function stop() {
 async function restartCamera() {
   const wasRunning = running;
   running = false;
-  stopFrameLoop();
+  cancelAnimationFrame(rafId);
+  rafId = 0;
   if (stream) {
     stream.getTracks().forEach((track) => track.stop());
   }
@@ -176,7 +178,7 @@ async function restartCamera() {
     fpsMeter = resetFpsMeter();
     lastAnalysisMs = 0;
     running = true;
-    startFrameLoop();
+    rafId = requestAnimationFrame(processFrame);
   }
 }
 
@@ -186,12 +188,12 @@ async function ensureFaceLandmarker() {
   const options = {
     baseOptions: {
       modelAssetPath: MODEL_URL,
-      delegate: "GPU",
+      delegate: IS_MOBILE ? "CPU" : "GPU",
     },
-    numFaces: getMaxFaces(),
-    minFaceDetectionConfidence: 0.72,
-    minFacePresenceConfidence: 0.68,
-    minTrackingConfidence: 0.55,
+    numFaces: effectiveMaxFaces(),
+    minFaceDetectionConfidence: IS_MOBILE ? 0.68 : 0.72,
+    minFacePresenceConfidence: IS_MOBILE ? 0.68 : 0.68,
+    minTrackingConfidence: IS_MOBILE ? 0.58 : 0.55,
     outputFaceBlendshapes: false,
     runningMode: "VIDEO",
   };
@@ -215,9 +217,9 @@ async function openCamera() {
   const constraints = {
     audio: false,
     video: {
-      width: { ideal: 1280 },
-      height: { ideal: 720 },
-      frameRate: { ideal: 30, max: 60 },
+      width: { ideal: IS_MOBILE ? 640 : 1280 },
+      height: { ideal: IS_MOBILE ? 480 : 720 },
+      frameRate: { ideal: IS_MOBILE ? 24 : 30, max: IS_MOBILE ? 30 : 60 },
       ...(selectedDeviceId
         ? { deviceId: { exact: selectedDeviceId } }
         : { facingMode: { ideal: currentFacingMode } }),
@@ -296,7 +298,7 @@ function processFrame(nowMs) {
   if (video.readyState >= 2 && video.videoWidth && video.videoHeight) {
     fitCanvasToVideo(false, nowMs);
 
-    if (nowMs >= cameraWarmupUntilMs && nowMs - lastAnalysisMs >= MIN_INFERENCE_INTERVAL_MS) {
+    if (nowMs >= cameraWarmupUntilMs && nowMs - lastAnalysisMs >= INFERENCE_INTERVAL_MS) {
       lastAnalysisMs = nowMs;
       drawSampleFrame();
       analyzeFrame(nowMs);
@@ -309,51 +311,12 @@ function processFrame(nowMs) {
     lastUiRenderMs = nowMs;
   }
 
-  if (frameLoopMode === "raf") {
-    rafId = requestAnimationFrame(processFrame);
-  }
-}
-
-function startFrameLoop() {
-  frameLoopMode = "raf";
-  frameLoopCancelId = 0;
-
-  if (typeof el.cameraFeed.requestVideoFrameCallback === "function") {
-    frameLoopMode = "video";
-    scheduleVideoFrame();
-    return;
-  }
-
   rafId = requestAnimationFrame(processFrame);
-}
-
-function stopFrameLoop() {
-  if (
-    frameLoopMode === "video" &&
-    typeof el.cameraFeed.cancelVideoFrameCallback === "function" &&
-    frameLoopCancelId
-  ) {
-    el.cameraFeed.cancelVideoFrameCallback(frameLoopCancelId);
-  }
-  frameLoopCancelId = 0;
-  cancelAnimationFrame(rafId);
-  rafId = 0;
-}
-
-function scheduleVideoFrame() {
-  if (!running || frameLoopMode !== "video") return;
-  frameLoopCancelId = el.cameraFeed.requestVideoFrameCallback(onVideoFrame);
-}
-
-function onVideoFrame(nowMs) {
-  if (!running || frameLoopMode !== "video") return;
-  processFrame(typeof nowMs === "number" ? nowMs : performance.now());
-  scheduleVideoFrame();
 }
 
 function analyzeFrame(nowMs) {
   try {
-    const results = faceLandmarker.detectForVideo(el.sampleCanvas, nowMs);
+    const results = faceLandmarker.detectForVideo(el.cameraFeed, nowMs);
     const timestamp = nowMs / 1000;
     const detections = collectDetections(results.faceLandmarks ?? []);
     matchTracks(detections, timestamp, nowMs);
@@ -365,11 +328,13 @@ function analyzeFrame(nowMs) {
 }
 
 function drawSampleFrame() {
-  const { width: canvasWidth, height: canvasHeight } = el.sampleCanvas;
-  if (!canvasWidth || !canvasHeight) return;
   const { videoWidth, videoHeight } = el.cameraFeed;
   if (!videoWidth || !videoHeight) return;
-  sampleCtx.drawImage(el.cameraFeed, 0, 0, canvasWidth, canvasHeight);
+  if (el.sampleCanvas.width !== videoWidth || el.sampleCanvas.height !== videoHeight) {
+    el.sampleCanvas.width = videoWidth;
+    el.sampleCanvas.height = videoHeight;
+  }
+  sampleCtx.drawImage(el.cameraFeed, 0, 0, videoWidth, videoHeight);
 }
 
 function fitCanvasToVideo(force = false, nowMs = performance.now()) {
@@ -378,13 +343,12 @@ function fitCanvasToVideo(force = false, nowMs = performance.now()) {
   if (!force && videoWidth === lastVideoWidth && videoHeight === lastVideoHeight) {
     return;
   }
-  const size = processingSize(videoWidth, videoHeight);
   lastVideoWidth = videoWidth;
   lastVideoHeight = videoHeight;
-  el.overlayCanvas.width = size.width;
-  el.overlayCanvas.height = size.height;
-  el.sampleCanvas.width = size.width;
-  el.sampleCanvas.height = size.height;
+  el.overlayCanvas.width = videoWidth;
+  el.overlayCanvas.height = videoHeight;
+  el.sampleCanvas.width = videoWidth;
+  el.sampleCanvas.height = videoHeight;
   el.resolutionText.textContent = `${videoWidth} x ${videoHeight}`;
   tracks.clear();
   nextTrackId = 1;
@@ -392,14 +356,6 @@ function fitCanvasToVideo(force = false, nowMs = performance.now()) {
   renderPeople();
   cameraWarmupUntilMs = nowMs + CAMERA_WARMUP_MS;
   lastAnalysisMs = 0;
-}
-
-function processingSize(width, height) {
-  const scale = Math.min(1, MAX_PROCESSING_SIDE / Math.max(width, height));
-  return {
-    width: Math.max(1, Math.round(width * scale)),
-    height: Math.max(1, Math.round(height * scale)),
-  };
 }
 
 function collectDetections(faceLandmarks) {
@@ -1056,6 +1012,10 @@ function setButtons(isBusy) {
 
 function getMaxFaces() {
   return Number(el.maxFacesSelect.value);
+}
+
+function effectiveMaxFaces() {
+  return IS_MOBILE ? Math.min(getMaxFaces(), 2) : getMaxFaces();
 }
 
 function cameraErrorMessage(error) {
