@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PulseCam 多人实时心率</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Browser rPPG Lab</p>
+          <h1>PulseCam 多人实时心率</h1>
+        </div>
+        <div class="status-pill" id="modelStatus">
+          <span class="status-dot idle"></span>
+          <span>待启动</span>
+        </div>
+      </header>
+
+      <section class="workspace">
+        <div class="stage-panel">
+          <div class="camera-stage" id="cameraStage">
+            <video id="cameraFeed" playsinline autoplay muted></video>
+            <canvas id="overlayCanvas"></canvas>
+            <div class="stage-placeholder" id="stagePlaceholder">
+              <strong>等待摄像头</strong>
+              <span>启动后开始检测人脸与脉搏信号</span>
+            </div>
+          </div>
+          <div class="stage-footer">
+            <span id="resolutionText">-- x --</span>
+            <span id="fpsText">0 fps</span>
+            <span id="faceCountText">0 人</span>
+          </div>
+        </div>
+
+        <aside class="control-panel">
+          <div class="control-row">
+            <button class="primary-button" id="startButton" type="button">
+              <span data-lucide="video"></span>
+              <span>开始</span>
+            </button>
+            <button class="ghost-button" id="stopButton" type="button" disabled>
+              <span data-lucide="square"></span>
+              <span>停止</span>
+            </button>
+          </div>
+
+          <label class="field">
+            <span>摄像头</span>
+            <select id="cameraSelect">
+              <option value="">默认摄像头</option>
+            </select>
+          </label>
+
+          <div class="field-grid">
+            <label class="field">
+              <span>最多人数</span>
+              <select id="maxFacesSelect">
+                <option value="1">1 人</option>
+                <option value="2">2 人</option>
+                <option value="4" selected>4 人</option>
+                <option value="6">6 人</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>分析窗口</span>
+              <select id="windowSelect">
+                <option value="12">12 秒</option>
+                <option value="18" selected>18 秒</option>
+                <option value="24">24 秒</option>
+              </select>
+            </label>
+          </div>
+
+          <section class="metric-strip" aria-label="实时状态">
+            <div>
+              <span class="metric-value" id="sampleRateText">0</span>
+              <span class="metric-label">Hz</span>
+            </div>
+            <div>
+              <span class="metric-value" id="qualityText">--</span>
+              <span class="metric-label">信号</span>
+            </div>
+            <div>
+              <span class="metric-value" id="runtimeText">00:00</span>
+              <span class="metric-label">时长</span>
+            </div>
+          </section>
+
+          <section class="people-section">
+            <div class="section-title">
+              <h2>人员</h2>
+              <span id="activeTracksText">0 active</span>
+            </div>
+            <div class="people-list" id="peopleList">
+              <div class="empty-state">未检测到人脸</div>
+            </div>
+          </section>
+
+          <p class="notice">
+            心率为摄像头远程光电容积描记估算值，仅用于实验与参考，不可用于医疗诊断。
+          </p>
+        </aside>
+      </section>
+    </main>
+
+    <canvas id="sampleCanvas" class="hidden-canvas"></canvas>
+
+    <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
