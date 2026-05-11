@@ -14,9 +14,9 @@ const MAX_SIGNAL_SECONDS = 32;
 const MIN_ANALYSIS_SECONDS = 8;
 const TRACK_TTL_SECONDS = 1.4;
 const ESTIMATE_INTERVAL_MS = 900;
-const MIN_INFERENCE_INTERVAL_MS = 70;
+const MIN_INFERENCE_INTERVAL_MS = 100;
 const CAMERA_WARMUP_MS = 700;
-const MAX_PROCESSING_SIDE = 720;
+const MAX_PROCESSING_SIDE = 480;
 const MIN_FACE_BOX_AREA_RATIO = 0.015;
 const MAX_FACE_BOX_AREA_RATIO = 0.62;
 const MIN_FACE_BOX_ASPECT_RATIO = 0.5;
@@ -65,11 +65,12 @@ let tracks = new Map();
 let fpsMeter = resetFpsMeter();
 let lastUiRenderMs = 0;
 let lastAnalysisMs = 0;
-let lastVideoFrameId = -1;
 let lastVideoWidth = 0;
 let lastVideoHeight = 0;
 let cameraWarmupUntilMs = 0;
 let currentFacingMode = "user";
+let frameLoopMode = "raf";
+let frameLoopCancelId = 0;
 
 window.lucide?.createIcons();
 
@@ -129,7 +130,7 @@ async function start() {
     running = true;
     el.stagePlaceholder.classList.add("is-hidden");
     setStatus("实时检测中", "ready");
-    rafId = requestAnimationFrame(processFrame);
+    startFrameLoop();
   } catch (error) {
     console.error(error);
     stop();
@@ -141,7 +142,7 @@ async function start() {
 
 function stop() {
   running = false;
-  cancelAnimationFrame(rafId);
+  stopFrameLoop();
   if (stream) {
     stream.getTracks().forEach((track) => track.stop());
     stream = null;
@@ -154,7 +155,6 @@ function stop() {
   updateStats(0);
   fpsMeter = resetFpsMeter();
   lastAnalysisMs = 0;
-  lastVideoFrameId = -1;
   lastVideoWidth = 0;
   lastVideoHeight = 0;
   cameraWarmupUntilMs = 0;
@@ -166,7 +166,7 @@ function stop() {
 async function restartCamera() {
   const wasRunning = running;
   running = false;
-  cancelAnimationFrame(rafId);
+  stopFrameLoop();
   if (stream) {
     stream.getTracks().forEach((track) => track.stop());
   }
@@ -176,7 +176,7 @@ async function restartCamera() {
     fpsMeter = resetFpsMeter();
     lastAnalysisMs = 0;
     running = true;
-    rafId = requestAnimationFrame(processFrame);
+    startFrameLoop();
   }
 }
 
@@ -296,18 +296,10 @@ function processFrame(nowMs) {
   if (video.readyState >= 2 && video.videoWidth && video.videoHeight) {
     fitCanvasToVideo(false, nowMs);
 
-    const frameId = getVideoFrameId(video);
-    const hasNewFrame = frameId !== lastVideoFrameId;
-    const isInferenceDue = nowMs - lastAnalysisMs >= MIN_INFERENCE_INTERVAL_MS;
-    const isFrameCheckStale = nowMs - lastAnalysisMs >= 500;
-
-    if (isInferenceDue && (hasNewFrame || isFrameCheckStale)) {
-      lastVideoFrameId = frameId;
+    if (nowMs >= cameraWarmupUntilMs && nowMs - lastAnalysisMs >= MIN_INFERENCE_INTERVAL_MS) {
       lastAnalysisMs = nowMs;
       drawSampleFrame();
-      if (nowMs >= cameraWarmupUntilMs) {
-        analyzeFrame(nowMs);
-      }
+      analyzeFrame(nowMs);
     }
   }
 
@@ -317,7 +309,46 @@ function processFrame(nowMs) {
     lastUiRenderMs = nowMs;
   }
 
+  if (frameLoopMode === "raf") {
+    rafId = requestAnimationFrame(processFrame);
+  }
+}
+
+function startFrameLoop() {
+  frameLoopMode = "raf";
+  frameLoopCancelId = 0;
+
+  if (typeof el.cameraFeed.requestVideoFrameCallback === "function") {
+    frameLoopMode = "video";
+    scheduleVideoFrame();
+    return;
+  }
+
   rafId = requestAnimationFrame(processFrame);
+}
+
+function stopFrameLoop() {
+  if (
+    frameLoopMode === "video" &&
+    typeof el.cameraFeed.cancelVideoFrameCallback === "function" &&
+    frameLoopCancelId
+  ) {
+    el.cameraFeed.cancelVideoFrameCallback(frameLoopCancelId);
+  }
+  frameLoopCancelId = 0;
+  cancelAnimationFrame(rafId);
+  rafId = 0;
+}
+
+function scheduleVideoFrame() {
+  if (!running || frameLoopMode !== "video") return;
+  frameLoopCancelId = el.cameraFeed.requestVideoFrameCallback(onVideoFrame);
+}
+
+function onVideoFrame(nowMs) {
+  if (!running || frameLoopMode !== "video") return;
+  processFrame(typeof nowMs === "number" ? nowMs : performance.now());
+  scheduleVideoFrame();
 }
 
 function analyzeFrame(nowMs) {
@@ -360,18 +391,7 @@ function fitCanvasToVideo(force = false, nowMs = performance.now()) {
   clearCanvas(overlayCtx, el.overlayCanvas);
   renderPeople();
   cameraWarmupUntilMs = nowMs + CAMERA_WARMUP_MS;
-  lastVideoFrameId = -1;
   lastAnalysisMs = 0;
-}
-
-function getVideoFrameId(video) {
-  const totalFrames = video.getVideoPlaybackQuality?.().totalVideoFrames;
-  if (Number.isFinite(totalFrames) && totalFrames > 0) return totalFrames;
-
-  const decodedFrames = video.webkitDecodedFrameCount;
-  if (Number.isFinite(decodedFrames) && decodedFrames > 0) return decodedFrames;
-
-  return video.currentTime;
 }
 
 function processingSize(width, height) {
